@@ -6,13 +6,18 @@ _NT_BEGIN
 #include "..\inc\initterm.h"
 #include "resource.h"
 
+void DumpToken(HWND hwnd, HANDLE hToken);
+void DumpObjectSecurity(HWND hwnd, HANDLE hObject);
+HWND ShowXY(void (*fn)(HWND , HANDLE), HANDLE hObject, PCWSTR caption, HWND hwndParent, HFONT hFont);
+void SetEditTxt(HWND hwnd, HANDLE hObject);
+
 BEGIN_PRIVILEGES(tp_tcb_dbg, 2)
 	LAA(SE_TCB_PRIVILEGE),
 	LAA(SE_DEBUG_PRIVILEGE),
 END_PRIVILEGES
 
 const OBJECT_ATTRIBUTES zoa = { sizeof(zoa) };
-volatile const UCHAR guz = 0;
+extern const volatile UCHAR guz = 0;
 
 union ProcessFlags {
 	ULONG Flags;
@@ -30,7 +35,8 @@ union ProcessFlags {
 		ULONG IsBreakOnTermination : 1;
 		ULONG IsInJob : 1;
 		ULONG IsAppContainer : 1;
-		ULONG SpareBits : 20;
+		ULONG SpareBits : 12;
+		ULONG ProtectionLevel : 8; // if IsProtectedProcess
 	};
 };
 
@@ -43,11 +49,11 @@ enum {
 	iName, 
 	iSession,
 	iLevel, 
+	iProtectedProcess,
 	iBreakOnTermination,
 	iWow64Process,
 	iAppContainer,
 	iInJob,
-	iProtectedProcess,
 	iCrossSessionCreate,
 	iStronglyNamed,
 	iFrozen,
@@ -104,7 +110,7 @@ extern const SECURITY_QUALITY_OF_SERVICE sqos = {
 
 extern const OBJECT_ATTRIBUTES oa_sqos = { sizeof(oa_sqos), 0, 0, 0, 0, const_cast<SECURITY_QUALITY_OF_SERVICE*>(&sqos) };
 
-NTSTATUS GetToken(PVOID buf, const TOKEN_PRIVILEGES* RequiredSet)
+NTSTATUS GetToken(_In_ PVOID buf, _In_ const TOKEN_PRIVILEGES* RequiredSet, _Out_ PHANDLE TokenHandle)
 {
 	NTSTATUS status;
 
@@ -143,19 +149,14 @@ NTSTATUS GetToken(PVOID buf, const TOKEN_PRIVILEGES* RequiredSet)
 
 					if (0 <= status)
 					{
-						status = NtAdjustPrivilegesToken(hNewToken, FALSE, const_cast<PTOKEN_PRIVILEGES>(RequiredSet), 0, 0, 0);
-
-						if (STATUS_SUCCESS == status)	
+						if (STATUS_SUCCESS == (status = NtAdjustPrivilegesToken(hNewToken, 
+							FALSE, const_cast<PTOKEN_PRIVILEGES>(RequiredSet), 0, 0, 0)))	
 						{
-							status = NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &hNewToken, sizeof(hNewToken));
+							*TokenHandle = hNewToken;
+							return STATUS_SUCCESS;
 						}
 
 						NtClose(hNewToken);
-
-						if (STATUS_SUCCESS == status)
-						{
-							return STATUS_SUCCESS;
-						}
 					}
 				}
 			}
@@ -208,7 +209,7 @@ class ProcessList
 	int(__cdecl* _sortfn)(PSYSTEM_PROCESS_INFORMATION& p, PSYSTEM_PROCESS_INFORMATION& q) = 0;
 	ULONG _count = 0;
 
-	NTSTATUS CreatePlain();
+	NTSTATUS CreatePlain(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDLE TokenHandle);
 
 	void InitVector()
 	{
@@ -268,14 +269,14 @@ public:
 		return _count;
 	}
 
-	NTSTATUS Create();
+	NTSTATUS Create(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDLE TokenHandle);
 };
 
-NTSTATUS ProcessList::Create()
+NTSTATUS ProcessList::Create(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDLE TokenHandle)
 {
 	ULONG count = _count;
 
-	NTSTATUS status = CreatePlain();
+	NTSTATUS status = CreatePlain(bExistProtectionInfo, TokenHandle);
 
 	if (0 <= status)
 	{
@@ -303,7 +304,7 @@ NTSTATUS ProcessList::Create()
 	return status;
 }
 
-NTSTATUS ProcessList::CreatePlain()
+NTSTATUS ProcessList::CreatePlain(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDLE TokenHandle)
 {
 	if (_buf)
 	{
@@ -326,6 +327,7 @@ NTSTATUS ProcessList::CreatePlain()
 
 	PROCESS_EXTENDED_BASIC_INFORMATION pebi = { sizeof(pebi) };
 
+
 	PVOID stack = alloca(guz);
 	ULONG cbHeap = 0x10000, count = 0, cb = 0, rcb = sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_SID_SIZE(1), n = 0;
 
@@ -339,8 +341,21 @@ NTSTATUS ProcessList::CreatePlain()
 			{
 				_buf = buf;
 
-				HANDLE hProcess, hToken;
-				GetToken(buf, &tp_tcb_dbg);
+				HANDLE hProcess, hToken = *TokenHandle;
+
+				if (!hToken)
+				{
+					if (0 <= GetToken(buf, &tp_tcb_dbg, &hToken))
+					{
+						*TokenHandle = hToken;
+					}
+				}
+
+				BOOL bRevertToSelf = FALSE;
+				if (hToken)
+				{
+					bRevertToSelf = 0 <= NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &hToken, sizeof(hToken));
+				}
 
 				ULONG NextEntryOffset = 0;
 
@@ -369,6 +384,16 @@ NTSTATUS ProcessList::CreatePlain()
 						{
 							pebi.SpareBits = 0;
 							pf->Flags = pebi.Flags;
+
+							if (pebi.IsProtectedProcess && bExistProtectionInfo)
+							{
+								PS_PROTECTION ps;
+
+								if (0 <= NtQueryInformationProcess(hProcess, ProcessProtectionInformation, &ps, sizeof(ps), &rcb))
+								{
+									pf->ProtectionLevel = ps.Level;
+								}
+							}
 						}
 						else
 						{
@@ -451,7 +476,10 @@ NTSTATUS ProcessList::CreatePlain()
 
 				} while (NextEntryOffset = pspi->NextEntryOffset);
 
-				NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &(hToken = 0), sizeof(hToken));
+				if (bRevertToSelf)
+				{
+					NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &(hToken = 0), sizeof(hToken));
+				}
 
 				_count = count;
 
@@ -470,6 +498,9 @@ NTSTATUS ProcessList::CreatePlain()
 class CDlg : public ZDlg, CIcons
 {
 	ProcessList _pl;
+	HANDLE _hSysToken = 0;
+	HFONT _hFont = 0;
+	ULONG _gNtVersion;
 	ULONG _iItem = MAXULONG;
 	ULONG _iSubItem = 0;
 	int _s[iMax];
@@ -481,7 +512,7 @@ class CDlg : public ZDlg, CIcons
 
 	void Refresh(HWND hwndDlg, HWND hwnd)
 	{
-		_pl.Create();
+		_pl.Create(_gNtVersion >= _WIN32_WINNT_WINBLUE, &_hSysToken);
 		ListView_SetItemCountEx(hwnd, _pl(), 0);
 		InvalidateRect(hwnd, 0, TRUE);
 		OnItemSelected(_iItem, hwndDlg);
@@ -490,6 +521,23 @@ class CDlg : public ZDlg, CIcons
 	void OnInitDialog(HWND hwndDlg)
 	{
 		SetIcons(hwndDlg, (HINSTANCE)&__ImageBase, MAKEINTRESOURCEW(IDI_ICON_G));
+
+		NONCLIENTMETRICS ncm = { sizeof(NONCLIENTMETRICS) };
+		if (SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+		{
+			ncm.lfCaptionFont.lfHeight = -ncm.iMenuHeight;
+			ncm.lfCaptionFont.lfWeight = FW_NORMAL;
+			ncm.lfCaptionFont.lfQuality = CLEARTYPE_QUALITY;
+			ncm.lfCaptionFont.lfPitchAndFamily = FIXED_PITCH|FF_MODERN;
+			wcscpy(ncm.lfCaptionFont.lfFaceName, L"Courier New");
+
+			_hFont = CreateFontIndirect(&ncm.lfCaptionFont);
+		}
+
+		if (_gNtVersion < _WIN32_WINNT_WINBLUE)
+		{
+			ShowWindow(GetDlgItem(hwndDlg, IDC_BUTTON5), SW_HIDE);
+		}
 
 		HWND hwnd = GetDlgItem(hwndDlg, IDC_LIST1);
 
@@ -516,11 +564,11 @@ class CDlg : public ZDlg, CIcons
 			L" Name ", 
 			L"S_id", 
 			L" IL ", 
+			L"  P ", 
 			L" T ", 
 			L" W ", 
 			L" A ",
 			L" J ",
-			L" P ", 
 			L" C ", 
 			L" N ", 
 			L" F ",
@@ -530,7 +578,7 @@ class CDlg : public ZDlg, CIcons
 			L" S ", 
 		};
 
-		static const ULONG lens[] = { 8, 8, 8, 26, 6, 8, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 };
+		static const ULONG lens[] = { 8, 8, 8, 30, 6, 8, 7, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 };
 
 		C_ASSERT(_countof(headers) == _countof(lens));
 
@@ -577,6 +625,10 @@ class CDlg : public ZDlg, CIcons
 			OnInitDialog(hwndDlg);
 			break;
 
+		case WM_DESTROY:
+			OnDestroy();
+			break;
+
 		case WM_COMMAND:
 			switch (wParam)
 			{
@@ -589,8 +641,18 @@ class CDlg : public ZDlg, CIcons
 			case IDC_BUTTON2:
 				Toggle(hwndDlg);
 				break;
+			case IDC_BUTTON3:
+				ShowToken(hwndDlg);
+				break;
+			case IDC_BUTTON4:
+				ShowDACL(hwndDlg);
+				break;
+			case IDC_BUTTON5:
+				ShowCmdLine(hwndDlg);
+				break;
 			}
 			break;
+
 		case WM_NOTIFY:
 			switch (reinterpret_cast<NMHDR*>(lParam)->code)
 			{
@@ -657,9 +719,149 @@ class CDlg : public ZDlg, CIcons
 		ShowErrorBox(hwndDlg, status ? HRESULT_FROM_NT(status) : S_OK, L"ProcessBreakOnTermination");
 	}
 
+	void ShowToken(HWND hwndDlg)
+	{
+		ULONG iItem = _iItem;
+		NTSTATUS status = STATUS_NOT_FOUND;
+		if (const SYSTEM_PROCESS_INFORMATION* pspi = _pl[iItem])
+		{
+			CLIENT_ID cid = { (HANDLE)pspi->UniqueProcessId };
+			
+			HANDLE hProcess, hToken, hSysToken;
+			
+			if (0 <= (status = NtOpenProcess(&hProcess, PROCESS_QUERY_LIMITED_INFORMATION, 
+				const_cast<OBJECT_ATTRIBUTES*>(&zoa), &cid)))
+			{
+				status = NtOpenProcessToken(hProcess, TOKEN_QUERY|TOKEN_QUERY_SOURCE|READ_CONTROL, &hToken);
+
+				if (0 > status && (hSysToken = _hSysToken))
+				{
+					if (0 <= NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &hSysToken, sizeof(hSysToken)))
+					{
+						status = NtOpenProcessToken(hProcess, TOKEN_QUERY|TOKEN_QUERY_SOURCE|READ_CONTROL, &hToken);
+						NtSetInformationThread(NtCurrentThread(), ThreadImpersonationToken, &hSysToken, sizeof(hSysToken));
+					}
+				}
+				
+				NtClose(hProcess);
+
+				if (0 <= status)
+				{
+					ULONG cb = pspi->ImageName.Length + sizeof(L"[12345678] Process Token");
+					PWSTR sz = (PWSTR)alloca(cb);
+					
+					swprintf_s(sz, cb/sizeof(WCHAR), L"[%x] %wZ Process Token", 
+						(ULONG)(ULONG_PTR)cid.UniqueProcess, &pspi->ImageName);
+					
+					ShowXY(DumpToken, hToken, sz, 0, _hFont);
+					
+					NtClose(hToken);
+				}
+			}
+		}	
+
+		if (status)
+		{
+			ShowErrorBox(hwndDlg, HRESULT_FROM_NT(status), L"Process Token");
+		}
+	}
+
+	void ShowDACL(HWND hwndDlg)
+	{
+		ULONG iItem = _iItem;
+		NTSTATUS status = STATUS_NOT_FOUND;
+		if (const SYSTEM_PROCESS_INFORMATION* pspi = _pl[iItem])
+		{
+			CLIENT_ID cid = { (HANDLE)pspi->UniqueProcessId };
+
+			HANDLE hProcess;
+
+			if (0 <= (status = NtOpenProcess(&hProcess, READ_CONTROL, const_cast<OBJECT_ATTRIBUTES*>(&zoa), &cid)))
+			{
+				ULONG cb = pspi->ImageName.Length + sizeof(L"[12345678] Process DACL");
+				PWSTR sz = (PWSTR)alloca(cb);
+
+				swprintf_s(sz, cb/sizeof(WCHAR), L"[%x] %wZ Process DACL", 
+					(ULONG)(ULONG_PTR)cid.UniqueProcess, &pspi->ImageName);
+
+				ShowXY(DumpObjectSecurity, hProcess, sz, 0, _hFont);
+
+				NtClose(hProcess);
+			}
+		}	
+
+		if (status)
+		{
+			ShowErrorBox(hwndDlg, HRESULT_FROM_NT(status), L"Process DACL");
+		}
+	}
+
+	void ShowCmdLine(HWND hwndDlg)
+	{
+		ULONG iItem = _iItem;
+		NTSTATUS status = STATUS_NOT_FOUND;
+		if (const SYSTEM_PROCESS_INFORMATION* pspi = _pl[iItem])
+		{
+			HANDLE hProcess;
+			CLIENT_ID cid = { pspi->UniqueProcessId };
+
+			if (0 <= (status = NtOpenProcess(&hProcess, PROCESS_QUERY_LIMITED_INFORMATION, const_cast<POBJECT_ATTRIBUTES>(&zoa), &cid)))
+			{
+				union {
+					PVOID buf;
+					PUNICODE_STRING CmdLine;
+					PWSTR psz;
+				};
+
+				ULONG cb = 0x100;
+
+				do 
+				{
+					status = STATUS_NO_MEMORY;
+
+					if (buf = LocalAlloc(0, cb))
+					{
+						if (0 <= (status = NtQueryInformationProcess(hProcess, ProcessCommandLineInformation, buf, cb, &cb)))
+						{
+							if (0 < swprintf_s(psz, cb / sizeof(WCHAR), L"%wZ", CmdLine))
+							{
+								cb = pspi->ImageName.Length + sizeof(L"[12345678] CommandLine");
+								PWSTR sz = (PWSTR)alloca(cb);
+
+								swprintf_s(sz, cb/sizeof(WCHAR), L"[%x] %wZ CommandLine", 
+									(ULONG)(ULONG_PTR)cid.UniqueProcess, &pspi->ImageName);
+
+								if (ShowXY(SetEditTxt, psz, sz, 0, _hFont))
+								{
+									buf = 0;
+								}
+							}
+						}
+
+						LocalFree(buf);
+					}
+
+				} while (status == STATUS_INFO_LENGTH_MISMATCH);
+
+				NtClose(hProcess);
+			}
+		}
+		if (status)
+		{
+			ShowErrorBox(hwndDlg, HRESULT_FROM_NT(status), L"Process DACL");
+		}
+	}
+
 	void OnItemSelected(ULONG iItem, HWND hwndDlg)
 	{
-		EnableWindow(GetDlgItem(hwndDlg, IDC_BUTTON2), iItem < _pl());
+		BOOL bEnable = iItem < _pl();
+		static const UINT id[] = { IDC_BUTTON2, IDC_BUTTON3, IDC_BUTTON4, IDC_BUTTON5 };
+		ULONG i = _countof(id) ;
+		do 
+		{
+			EnableWindow(GetDlgItem(hwndDlg, id[--i]), bEnable);
+		} while (i);
+
 		SetStatus(iItem, hwndDlg);
 	}
 
@@ -693,6 +895,25 @@ class CDlg : public ZDlg, CIcons
 
 		SetDlgItemTextW(hwndDlg, IDC_STATIC1, L"");
 	}
+
+	void OnDestroy()
+	{
+		union {
+			HFONT hFont;
+			HANDLE hToken;
+		};
+
+		if (hFont = _hFont) DeleteObject(_hFont);
+		if (hToken = _hSysToken) NtClose(_hSysToken);
+	}
+
+public:
+	CDlg()
+	{
+		ULONG M, m;
+		RtlGetNtVersionNumbers(&M, &m, 0);
+		_gNtVersion = (M << 8)| m;
+	}
 };
 
 void CDlg::GetItemInfo(LVITEM& Item)
@@ -725,6 +946,8 @@ void CDlg::GetItemInfo(LVITEM& Item)
 		{
 			static const PCWSTR yn[] = { L"", L" *" };
 
+			PS_PROTECTION pp;
+
 			PCWSTR pszText = L"";
 
 			switch (Item.iSubItem)
@@ -733,20 +956,28 @@ void CDlg::GetItemInfo(LVITEM& Item)
 				swprintf_s(Item.pszText, Item.cchTextMax, L"%03u", get_Number(pspi));
 				return;
 			case iPID:
-				swprintf_s(Item.pszText, Item.cchTextMax, L"%u", (ULONG)(ULONG_PTR)pspi->UniqueProcessId);
+				swprintf_s(Item.pszText, Item.cchTextMax, L"%4x", (ULONG)(ULONG_PTR)pspi->UniqueProcessId);
 				return;
 			case iFrom:
-				swprintf_s(Item.pszText, Item.cchTextMax, L"%u", (ULONG)(ULONG_PTR)pspi->InheritedFromUniqueProcessId);
+				swprintf_s(Item.pszText, Item.cchTextMax, L"%4x", (ULONG)(ULONG_PTR)pspi->InheritedFromUniqueProcessId);
 				return;
 			case iName:
 				swprintf_s(Item.pszText, Item.cchTextMax, L"%wZ", &pspi->ImageName);
 				return;
 			case iSession:
-				swprintf_s(Item.pszText, Item.cchTextMax, L"%x", pspi->SessionId);
+				swprintf_s(Item.pszText, Item.cchTextMax, L" %x", pspi->SessionId);
 				return;
 			case iLevel:
 				swprintf_s(Item.pszText, Item.cchTextMax, L" %04x", get_IL(pspi));
 				return;
+			case iProtectedProcess:
+				if (pp.Level = pf->ProtectionLevel)
+				{
+					swprintf_s(Item.pszText, Item.cchTextMax, L" %x.%x", pp.Signer, pp.Type);
+					return;
+				}
+				pszText = yn[pf->IsProtectedProcess];
+				break;
 			case iAppContainer:
 				pszText = yn[pf->IsAppContainer];
 				break;
@@ -767,9 +998,6 @@ void CDlg::GetItemInfo(LVITEM& Item)
 				break;
 			case iProcessDeleting:
 				pszText = yn[pf->IsProcessDeleting];
-				break;
-			case iProtectedProcess:
-				pszText = yn[pf->IsProtectedProcess];
 				break;
 			case iCrossSessionCreate:
 				pszText = yn[pf->IsCrossSessionCreate];
@@ -792,6 +1020,10 @@ void CDlg::GetItemInfo(LVITEM& Item)
 
 void CDlg::GetTipInfo(NMLVGETINFOTIP* pti)
 {
+	if (_gNtVersion < _WIN32_WINNT_WINBLUE)
+	{
+		return ;
+	}
 	if (const SYSTEM_PROCESS_INFORMATION* pspi = _pl[pti->iItem])
 	{
 		HANDLE hProcess;
@@ -1002,8 +1234,14 @@ int __cdecl SortByCross2(PSYSTEM_PROCESS_INFORMATION& p, PSYSTEM_PROCESS_INFORMA
 
 int __cdecl SortByProtected1(PSYSTEM_PROCESS_INFORMATION& p, PSYSTEM_PROCESS_INFORMATION& q)
 {
-	ULONG a = GetProcessFlags(p)->IsProtectedProcess;
-	ULONG b = GetProcessFlags(q)->IsProtectedProcess;
+	ULONG a = GetProcessFlags(p)->ProtectionLevel;
+	ULONG b = GetProcessFlags(q)->ProtectionLevel;
+
+	if (a < b) return -1;
+	if (a > b) return +1;
+
+	a = GetProcessFlags(p)->IsProtectedProcess;
+	b = GetProcessFlags(q)->IsProtectedProcess;
 
 	if (a < b) return -1;
 	if (a > b) return +1;
@@ -1013,8 +1251,14 @@ int __cdecl SortByProtected1(PSYSTEM_PROCESS_INFORMATION& p, PSYSTEM_PROCESS_INF
 
 int __cdecl SortByProtected2(PSYSTEM_PROCESS_INFORMATION& p, PSYSTEM_PROCESS_INFORMATION& q)
 {
-	ULONG a = GetProcessFlags(q)->IsProtectedProcess;
-	ULONG b = GetProcessFlags(p)->IsProtectedProcess;
+	ULONG a = GetProcessFlags(q)->ProtectionLevel;
+	ULONG b = GetProcessFlags(p)->ProtectionLevel;
+
+	if (a < b) return -1;
+	if (a > b) return +1;
+
+	a = GetProcessFlags(q)->IsProtectedProcess;
+	b = GetProcessFlags(p)->IsProtectedProcess;
 
 	if (a < b) return -1;
 	if (a > b) return +1;
