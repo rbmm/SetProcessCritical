@@ -503,7 +503,7 @@ class CDlg : public ZDlg, CIcons
 	ULONG _gNtVersion;
 	ULONG _iItem = MAXULONG;
 	ULONG _iSubItem = 0;
-	int _s[iMax];
+	LONG _sortbits = 0;
 
 	void GetItemInfo(LVITEM& Item);
 	void GetTipInfo(NMLVGETINFOTIP* pti);
@@ -552,8 +552,6 @@ class CDlg : public ZDlg, CIcons
 			SelectObject(hdc, o);
 			ReleaseDC(hwnd, hdc);
 		}
-
-		RtlFillMemoryUlong(_s, sizeof(_s), (ULONG)-1);
 
 		LVCOLUMN lvc = { LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM, LVCFMT_LEFT };
 
@@ -1388,7 +1386,7 @@ void CDlg::OnColumClick(ULONG iSubItem, HWND hwndLV)
 			_iSubItem = iSubItem;
 		}
 
-		lc.fmt = 0 < _s[iSubItem] ? LVCFMT_LEFT|HDF_SORTDOWN : LVCFMT_LEFT|HDF_SORTUP;
+		lc.fmt = 0 < _bittest(&_sortbits, iSubItem) ? LVCFMT_LEFT|HDF_SORTDOWN : LVCFMT_LEFT|HDF_SORTUP;
 
 		ListView_SetColumn(hwndLV, iSubItem, &lc);
 
@@ -1400,9 +1398,7 @@ bool CDlg::OnColumClick(ULONG iSubItem)
 {
 	if (iSubItem < iMax)
 	{
-		int s = -_s[iSubItem];
-
-		_s[iSubItem] = s;
+		int s = _bittestandcomplement(&_sortbits, iSubItem) ? -1 : +1;
 
 		switch (iSubItem)
 		{
