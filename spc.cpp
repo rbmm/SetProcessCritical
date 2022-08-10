@@ -412,27 +412,10 @@ NTSTATUS ProcessList::CreatePlain(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDL
 						{
 							if (fBreakOnTermination) pf->IsBreakOnTermination = TRUE;
 						}
-						else
-						{
-							__nop();
-						}
-
-						if (0 <= (s = NtQueryInformationProcess(hProcess, ProcessWow64Information, &wow, sizeof(wow), 0)))
-						{
-							if (wow) pf->IsWow64Process = TRUE;
-						}
-						else
-						{
-							__nop();
-						}
 
 						if (IsProcessInJob(hProcess, 0, &bInJob))
 						{
 							if (bInJob) pf->IsInJob = TRUE;
-						}
-						else
-						{
-							__nop();
 						}
 
 						if (0 <= (s = NtOpenProcessToken(hProcess, TOKEN_QUERY, &hToken)))
@@ -462,16 +445,8 @@ NTSTATUS ProcessList::CreatePlain(_In_ BOOL bExistProtectionInfo, _Inout_ PHANDL
 
 							NtClose(hToken);
 						}
-						else
-						{
-							__nop();
-						}
 
 						NtClose(hProcess);
-					}
-					else
-					{
-						__nop();
 					}
 
 				} while (NextEntryOffset = pspi->NextEntryOffset);
